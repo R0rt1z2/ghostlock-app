@@ -48,7 +48,7 @@
 
 打开 **GhostLock** 点击 **执行**。需先装 KernelSU（`me.weishu.kernelsu`）、ReSukiSU（`com.resukisu.resukisu`）或 KowsuSuperManager（`com.kowx712.supermanager`）以提供 `ksud`；缺 `ksud` 时 W1/W2 仍可拿到 uid 0，但不会加载模块。
 
-路线是双核竞争。6.6/6.12 树形 waiter 内核上主线程跑 `select` 爆破、consumer 线程扰动 waiter 优先级；6.1 紧凑 waiter 内核上主线程改走 `getsockopt(TCP_ZEROCOPY_RECEIVE)` 打洞页写入（`GHOSTLOCK_TCP_ROUTE=0` 强制回退 pselect 路线）。核心对默认取大核（不可用时回退 0/1），可用 `GHOSTLOCK_CORE` / `GHOSTLOCK_CONSUMER_CORE` 覆盖。
+路线是双核竞争。6.6/6.12 树形 waiter 内核上主线程跑 `select` 爆破、consumer 线程扰动 waiter 优先级；6.1 紧凑 waiter 内核上主线程改走 `getsockopt(TCP_ZEROCOPY_RECEIVE)` 打洞页写入。若 futex 栈帧离 `fd_set` 缓冲区太远、两条路线都够不到 waiter，则改用 `sendmsg`：`__sys_sendmsg` 的 `msghdr` 与八个快速 iovec 正好铺满整个陈旧 waiter，而 `import_iovec` 先拷贝向量再做校验（`GHOSTLOCK_TCP_ROUTE=0` 强制回退 fd_set 路线）。核心对默认取大核（不可用时回退 0/1），可用 `GHOSTLOCK_CORE` / `GHOSTLOCK_CONSUMER_CORE` 覆盖。
 
 ## 命令行调试
 
@@ -76,6 +76,8 @@ tools/extract_rs/target/release/ghostlock-extract.exe OTA.zip --format json --ou
 ### 前置检查
 
 提取器在提取偏移量前先反汇编 `remove_waiter()`。已包含修复的内核以退出码 `6` 拒绝；仅未修复内核继续。
+
+随后它会测量 futex waiter 相对 `core_sys_select` 缓冲区的位置；若 waiter 落在 fd_set 字之外，再测量相对 `__sys_sendmsg` iovec 数组的位置。条目用 `waiter_route`（0 = fd_set，1 = tcp zerocopy，2 = sendmsg iovec）与 `iov_waiter_off` 记录所选传输。退出码 `3` 表示没有任何传输能覆盖 waiter。
 
 ### 手机端运行
 

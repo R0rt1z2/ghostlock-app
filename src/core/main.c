@@ -235,6 +235,8 @@ void *waiter_thread(void *arg __attribute__((unused))) {
   futex_op(&f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout, &f_pi_target, 0);
   if (tcp_route_selected()) {
     do_tcp_fake_lock_route();
+  } else if (iov_route_selected()) {
+    do_iov_fake_lock_route();
   } else {
     do_pselect_fake_lock_route();
   }
@@ -283,9 +285,13 @@ void *consumer_thread(void *arg __attribute__((unused))) {
         atomic_store(&consumer_inflight, 1);
         errno = 0;
         /* rotate the nice every call; (calls%19)+1 is what makes
-         * sched_setattr succeed on 6.1 compact */
+         * sched_setattr succeed on 6.1 compact. The iovec route retries
+         * inside one run, and __sched_setscheduler skips the PI walk when
+         * nothing changed, so its nice has to move every call too. */
         int consumer_nice = (active_offsets && active_offsets->compact_waiter)
                                 ? (calls_this_seq % 19) + 1
+                            : iov_route_selected()
+                                ? (atomic_load(&consumer_calls) % 19) + 1
                                 : PSELECT_CONSUMER_NICE;
         long sched_ret = sched_setattr_tid(tid, consumer_nice);
         if (sched_ret != 0) {

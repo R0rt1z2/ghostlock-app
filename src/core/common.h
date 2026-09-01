@@ -79,6 +79,9 @@ extern int g_core_consumer;
 #define P0_DATA_ALIAS_CONST(image_addr) \
   (P0_PAGE_OFFSET | ((image_addr) - KIMAGE_TEXT_BASE + P0_KERNEL_PHYS_DELTA))
 
+/* UIO_FASTIOV: import_iovec() keeps this many iovecs on the sendmsg stack. */
+#define IOV_ROUTE_FASTIOV 8
+
 #define CONSUMER_MAX_CALLS 1
 #define PSELECT_ROUTE_NFDS 320
 #define PSELECT_CONSUMER_NICE 19
@@ -196,11 +199,15 @@ uintptr_t prepare_good_kernel_page(void);
 void fdset_put_word(fd_set *set, int word, uint64_t value);
 uint64_t fdset_get_word(const fd_set *set, int word);
 int tcp_route_selected(void);
+int iov_route_selected(void);
+int iov_waiter_byte(int off);
+int iov_route_delivers_task(void);
 void open_selected_fds(
     fd_set *in, fd_set *out, fd_set *ex, int read_fd, int write_fd);
 void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex);
 void do_pselect_fake_lock_route(void);
 void do_tcp_fake_lock_route(void);
+void do_iov_fake_lock_route(void);
 void reset_main_route_state(void);
 int run_main_route_threads(void);
 void set_pselect_write_mode(uintptr_t target, int mode);

